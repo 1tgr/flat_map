@@ -4,12 +4,14 @@ extern crate serde;
 extern crate serde_json;
 
 extern crate flat_map;
+extern crate quickcheck;
 
-use flat_map::FlatMap;
-use flat_map::Occupied;
-use flat_map::Vacant;
+use flat_map::{FlatMap, Occupied, Vacant};
+use flat_map::flat_map::{BinarySearch, LinearFront, LinearBack, Lookup};
+use quickcheck::{quickcheck, Arbitrary, Gen};
+
+use std::collections::BTreeMap;
 use std::iter::FromIterator;
-
 use std::rc::Rc;
 
 #[test]
@@ -537,6 +539,14 @@ fn test_split_off_large_random_sorted() {
     assert!(right.into_iter().eq(data.into_iter().filter(|x| x.0 >= key)));
 }
 
+#[test]
+fn test_hmm() {
+    let mut m = FlatMap::with_lookup(LinearFront);
+    assert_eq!(None, m.insert(-84, -59));
+    assert_eq!(None, m.insert(-70, 49));
+    assert_eq!(Some(-59), m.insert(-84, -41));
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn test_serde() {
@@ -545,4 +555,62 @@ fn test_serde() {
     let json = serde_json::to_string(&map).unwrap();
     let new_map: FlatMap<u64, u64> = serde_json::from_str(&json).unwrap();
     assert_eq!(new_map.get(&18), map.get(&18));
+}
+
+#[derive(Clone, Debug)]
+enum Action<Key, Value> {
+    Insert { key: Key, value: Value },
+    Remove { key: Key },
+    Get { key: Key },
+}
+
+impl<Key: Arbitrary, Value: Arbitrary> Arbitrary for Action<Key, Value> {
+    fn arbitrary<G: Gen>(g: &mut G) -> Self {
+        match u8::arbitrary(g) % 3 {
+            0 => Action::Insert {
+                key: Key::arbitrary(g),
+                value: Value::arbitrary(g),
+            },
+            1 => Action::Remove { key: Key::arbitrary(g) },
+            2 => Action::Get { key: Key::arbitrary(g) },
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn matches_btree_map<L: Lookup<isize, isize, isize>>(actions: Vec<Action<isize, isize>>, l: L) -> bool {
+    let mut map1 = BTreeMap::new();
+    let mut map2 = FlatMap::with_lookup(l);
+
+    for action in actions {
+        match action {
+            Action::Insert { key, value } => if map1.insert(key, value) != map2.insert(key, value) {
+                return false;
+            },
+
+            Action::Remove { key } => if map1.remove(&key) != map2.remove(&key) {
+                return false;
+            },
+
+            Action::Get { key } => if map1.get(&key) != map2.get(&key) {
+                return false;
+            },
+        }
+    }
+
+    true
+}
+
+quickcheck! {
+    fn qc_matches_btree_map_binary_search(actions: Vec<Action<isize, isize>>) -> bool {
+        matches_btree_map(actions, BinarySearch)
+    }
+
+    fn qc_matches_btree_map_linear_front(actions: Vec<Action<isize, isize>>) -> bool {
+        matches_btree_map(actions, LinearFront)
+    }
+
+    fn qc_matches_btree_map_linear_back(actions: Vec<Action<isize, isize>>) -> bool {
+        matches_btree_map(actions, LinearBack)
+    }
 }

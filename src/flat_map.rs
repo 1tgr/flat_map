@@ -10,9 +10,58 @@ use std::iter::{Map, FromIterator};
 use std::mem::swap;
 use std::ops::Index;
 use std::slice;
+
+pub trait Lookup<K, V, Q: ?Sized> {
+    fn lookup(&self, slice: &[(K, V)], key: &Q) -> Result<usize, usize>;
+}
+
+#[derive(Copy, Clone, Default)]
+pub struct BinarySearch;
+
+#[derive(Copy, Clone, Default)]
+pub struct LinearFront;
+
+#[derive(Copy, Clone, Default)]
+pub struct LinearBack;
+
+impl<K, V, Q> Lookup<K, V, Q> for BinarySearch where K: Borrow<Q>, Q: ?Sized + Ord {
+    fn lookup(&self, slice: &[(K, V)], q: &Q) -> Result<usize, usize> {
+        slice.binary_search_by(|&(ref k, _)| k.borrow().cmp(q))
+    }
+}
+
+impl<K, V, Q> Lookup<K, V, Q> for LinearFront where K: Borrow<Q> + PartialEq, Q: ?Sized + Ord {
+    fn lookup(&self, slice: &[(K, V)], q: &Q) -> Result<usize, usize> {
+        for (index, &(ref k, _)) in slice.iter().enumerate() {
+            match k.borrow().cmp(q) {
+                Ordering::Less => (),
+                Ordering::Equal => { return Ok(index); },
+                Ordering::Greater => { return Err(index); },
+            }
+        }
+
+        Err(slice.len())
+    }
+}
+
+impl<K, V, Q> Lookup<K, V, Q> for LinearBack where K: Borrow<Q> + PartialEq, Q: ?Sized + Ord {
+    fn lookup(&self, slice: &[(K, V)], q: &Q) -> Result<usize, usize> {
+        for (index, &(ref k, _)) in slice.iter().enumerate().rev() {
+            match k.borrow().cmp(q) {
+                Ordering::Less => { return Err(index + 1); },
+                Ordering::Equal => { return Ok(index); },
+                Ordering::Greater => (),
+            }
+        }
+
+        Err(0)
+    }
+}
+
 #[derive(Clone)]
-pub struct FlatMap<K, V> {
+pub struct FlatMap<K, V, L = BinarySearch> {
     v: Vec<(K, V)>,
+    l: L,
 }
 
 pub enum Entry<'a, K: 'a, V: 'a> {
@@ -55,14 +104,28 @@ pub struct Values<'a, K: 'a, V: 'a> {
     inner: Map<Iter<'a, K, V>, fn((&'a K, &'a V)) -> &'a V>,
 }
 
-impl<K, V> FlatMap<K, V> {
-
-    pub fn new() -> FlatMap<K, V> {
-        FlatMap { v: vec![] }
+impl<K, V> FlatMap<K, V, BinarySearch> {
+    pub fn new() -> Self {
+        FlatMap {
+            v: vec![],
+            l: Default::default()
+        }
     }
 
-    pub fn with_capacity(capacity: usize) -> FlatMap<K, V> {
-        FlatMap { v: Vec::with_capacity(capacity) }
+    pub fn with_capacity(capacity: usize) -> Self {
+        FlatMap {
+            v: Vec::with_capacity(capacity),
+            l: Default::default()
+        }
+    }
+}
+
+impl<K, V, L> FlatMap<K, V, L> {
+    pub fn with_lookup(l: L) -> Self {
+        FlatMap {
+            v: vec![],
+            l
+        }
     }
 
     /// Returns the number of elements the `VecMap` can hold without
@@ -148,9 +211,9 @@ impl<K, V> FlatMap<K, V> {
     }
 }
 
-impl<K: Ord, V> FlatMap<K, V> {
+impl<K: Ord, V, L: Lookup<K, V, K>> FlatMap<K, V, L> {
     pub fn insert(&mut self, key: K, mut v: V) -> Option<V> {
-        match self.v[..].binary_search_by(|&(ref k, _)| k.cmp(&key)) {
+        match self.l.lookup(&self.v[..], &key) {
             Err(i) => {
                 self.v.insert(i, (key, v));
                 None
@@ -170,22 +233,46 @@ impl<K: Ord, V> FlatMap<K, V> {
         }
     }
 
-    pub fn split_off(&mut self, key: &K) -> Self {
-        match self.v[..].binary_search_by(|&(ref k, _)| k.cmp(key)) {
-            Err(_) => Self::new(),
-            Ok(at) => {
-                let v = self.v.split_off(at);
-                FlatMap { v: v }
+    pub fn entry(&mut self, key: K) -> Entry<K, V> {
+        match self.l.lookup(&self.v[..], &key) {
+            Err(i) => {
+                Vacant(VacantEntry {
+                           v: &mut self.v,
+                           key: key,
+                           index: i,
+                       })
+            }
+            Ok(i) => {
+                Occupied(OccupiedEntry {
+                             v: &mut self.v,
+                             index: i,
+                         })
             }
         }
-
     }
+}
 
+impl<K: Ord, V, L: Lookup<K, V, K> + Clone> FlatMap<K, V, L> {
+    pub fn split_off(&mut self, key: &K) -> Self {
+        let v = match self.l.lookup(&self.v[..], &key) {
+            Err(_) => vec![],
+            Ok(at) => self.v.split_off(at),
+        };
+
+        FlatMap {
+            v,
+            l: self.l.clone()
+        }
+    }
+}
+
+impl<K, V, L> FlatMap<K, V, L> {
     pub fn get<Q: ?Sized>(&self, q: &Q) -> Option<&V>
         where K: Borrow<Q>,
-              Q: Ord
+              Q: Ord,
+              L: Lookup<K, V, Q>
     {
-        match self.v[..].binary_search_by(|&(ref k, _)| k.borrow().cmp(q)) {
+        match self.l.lookup(&self.v[..], q) {
             Err(_) => None,
             Ok(idx) => {
                 let (_, ref v) = self.v[idx];
@@ -196,7 +283,8 @@ impl<K: Ord, V> FlatMap<K, V> {
 
     pub fn contains_key<Q: ?Sized>(&self, k: &Q) -> bool
         where K: Borrow<Q>,
-              Q: Ord
+              Q: Ord,
+              L: Lookup<K, V, Q>
     {
         self.get(k).is_some()
     }
@@ -215,9 +303,10 @@ impl<K: Ord, V> FlatMap<K, V> {
     /// ```
     pub fn get_mut<Q: ?Sized>(&mut self, q: &Q) -> Option<&mut V>
         where K: Borrow<Q>,
-              Q: Ord
+              Q: Ord,
+              L: Lookup<K, V, Q>
     {
-        match self.v[..].binary_search_by(|&(ref k, _)| k.borrow().cmp(q)) {
+        match self.l.lookup(&self.v[..], q) {
             Err(_) => None,
             Ok(idx) => {
                 match self.v.get_mut(idx) {
@@ -228,29 +317,12 @@ impl<K: Ord, V> FlatMap<K, V> {
         }
     }
 
-    pub fn entry(&mut self, key: K) -> Entry<K, V> {
-        match self.v[..].binary_search_by(|&(ref k, _)| k.cmp(&key)) {
-            Err(i) => {
-                Vacant(VacantEntry {
-                           v: &mut self.v,
-                           key: key,
-                           index: i,
-                       })
-            }
-            Ok(i) => {
-                Occupied(OccupiedEntry {
-                             v: &mut self.v,
-                             index: i,
-                         })
-            }
-        }
-    }
-
     pub fn remove<Q: ?Sized>(&mut self, q: &Q) -> Option<V>
         where K: Borrow<Q>,
-              Q: Ord
+              Q: Ord,
+              L: Lookup<K, V, Q>
     {
-        match self.v[..].binary_search_by(|&(ref k, _)| k.borrow().cmp(q)) {
+        match self.l.lookup(&self.v[..], q) {
             Err(_) => None,
             Ok(i) => {
                 let (_, value) = self.v.remove(i);
@@ -396,7 +468,7 @@ impl<K, V> DoubleEndedIterator for IntoIter<K, V> {
 
 impl<K, V> ExactSizeIterator for IntoIter<K, V> {}
 
-impl<K, V> IntoIterator for FlatMap<K, V> {
+impl<K, V, L> IntoIterator for FlatMap<K, V, L> {
     type Item = (K, V);
     type IntoIter = IntoIter<K, V>;
 
@@ -405,7 +477,7 @@ impl<K, V> IntoIterator for FlatMap<K, V> {
     }
 }
 
-impl<'a, K, V> IntoIterator for &'a FlatMap<K, V> {
+impl<'a, K, V, L> IntoIterator for &'a FlatMap<K, V, L> {
     type Item = (&'a K, &'a V);
     type IntoIter = Iter<'a, K, V>;
 
@@ -414,7 +486,7 @@ impl<'a, K, V> IntoIterator for &'a FlatMap<K, V> {
     }
 }
 
-impl<'a, K, V> IntoIterator for &'a mut FlatMap<K, V> {
+impl<'a, K, V, L> IntoIterator for &'a mut FlatMap<K, V, L> {
     type Item = (&'a K, &'a mut V);
     type IntoIter = IterMut<'a, K, V>;
 
@@ -473,18 +545,19 @@ impl<'a, K, V> DoubleEndedIterator for Values<'a, K, V> {
 
 impl<'a, K, V> ExactSizeIterator for Values<'a, K, V> {}
 
-impl<K: Ord, V> FromIterator<(K, V)> for FlatMap<K, V> {
-    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> FlatMap<K, V> {
+impl<K: Ord, V> FromIterator<(K, V)> for FlatMap<K, V, BinarySearch> {
+    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
         let mut vec: Vec<_> = iter.into_iter().collect();
         vec.sort_by(|kv1, kv2| kv1.0.cmp(&kv2.0));
         vec.dedup_by(|kv1, kv2| kv1.0 == kv2.0);
         Self {
-            v: vec
+            v: vec,
+            l: Default::default(),
         }
     }
 }
 
-impl<K: Ord, V> Extend<(K, V)> for FlatMap<K, V> {
+impl<K: Ord, V, L> Extend<(K, V)> for FlatMap<K, V, L> where L: Lookup<K, V, K> {
     fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {
         for (k, v) in iter {
             self.insert(k, v);
@@ -492,13 +565,13 @@ impl<K: Ord, V> Extend<(K, V)> for FlatMap<K, V> {
     }
 }
 
-impl<'a, K: Ord + Copy, V: Copy> Extend<(&'a K, &'a V)> for FlatMap<K, V> {
+impl<'a, K: Ord + Copy, V: Copy, L> Extend<(&'a K, &'a V)> for FlatMap<K, V, L> where L: Lookup<K, V, K> {
     fn extend<I: IntoIterator<Item = (&'a K, &'a V)>>(&mut self, iter: I) {
         self.extend(iter.into_iter().map(|(&key, &value)| (key, value)));
     }
 }
 
-impl<K: Hash, V: Hash> Hash for FlatMap<K, V> {
+impl<K: Hash, V: Hash, L> Hash for FlatMap<K, V, L> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         for elt in self {
             elt.hash(state);
@@ -506,41 +579,45 @@ impl<K: Hash, V: Hash> Hash for FlatMap<K, V> {
     }
 }
 
-impl<K: Ord, V> Default for FlatMap<K, V> {
-    fn default() -> FlatMap<K, V> {
-        FlatMap::new()
+impl<K: Ord, V, L: Default> Default for FlatMap<K, V, L> {
+    fn default() -> Self {
+        FlatMap {
+            v: Vec::default(),
+            l: L::default(),
+        }
     }
 }
 
-impl<K: Ord, V: Ord> Ord for FlatMap<K, V> {
-    fn cmp(&self, other: &FlatMap<K, V>) -> Ordering {
+impl<K: Ord, V: Ord, L> Ord for FlatMap<K, V, L> {
+    fn cmp(&self, other: &FlatMap<K, V, L>) -> Ordering {
         self.iter().cmp(other.iter())
     }
 }
 
-impl<K: PartialEq, V: PartialEq> PartialEq for FlatMap<K, V> {
-    fn eq(&self, other: &FlatMap<K, V>) -> bool {
+impl<K: PartialEq, V: PartialEq, L> PartialEq for FlatMap<K, V, L> {
+    fn eq(&self, other: &FlatMap<K, V, L>) -> bool {
         self.len() == other.len() && self.iter().zip(other).all(|(a, b)| a == b)
     }
 }
 
-impl<K: Eq, V: Eq> Eq for FlatMap<K, V> {}
+impl<K: Eq, V: Eq, L> Eq for FlatMap<K, V, L> {}
 
-impl<K: PartialOrd, V: PartialOrd> PartialOrd for FlatMap<K, V> {
-    fn partial_cmp(&self, other: &FlatMap<K, V>) -> Option<Ordering> {
+impl<K: PartialOrd, V: PartialOrd, L> PartialOrd for FlatMap<K, V, L> {
+    fn partial_cmp(&self, other: &FlatMap<K, V, L>) -> Option<Ordering> {
         self.iter().partial_cmp(other.iter())
     }
 }
 
-impl<K: Debug, V: Debug> Debug for FlatMap<K, V> {
+impl<K: Debug, V: Debug, L> Debug for FlatMap<K, V, L> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_map().entries(self.iter()).finish()
     }
 }
 
-impl<'a, K: Ord, Q: ?Sized, V> Index<&'a Q> for FlatMap<K, V>
+impl<'a, K: Ord, Q: ?Sized, V, L> Index<&'a Q> for FlatMap<K, V, L>
     where K: Borrow<Q>,
-          Q: Ord
+          Q: Ord,
+          L: Lookup<K, V, Q>
 {
     type Output = V;
 
@@ -590,10 +667,10 @@ mod serde_impl
     use serde::de::{Deserialize, Deserializer, Visitor, MapAccess};
     use serde::{Serialize, Serializer};
     use serde::ser::SerializeMap;
-    use super::FlatMap;
+    use super::{FlatMap, Lookup};
     use std::fmt;
 
-    impl<K, V> Serialize for FlatMap<K, V>
+    impl<K, V, L> Serialize for FlatMap<K, V, L>
     where K: Ord + Serialize, V: Serialize {
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where
@@ -608,11 +685,11 @@ mod serde_impl
     }
 
 
-    struct FlatMapVisitor<K, V> {
-        marker: PhantomData<fn() -> FlatMap<K, V>>
+    struct FlatMapVisitor<K, V, L> {
+        marker: PhantomData<fn() -> FlatMap<K, V, L>>
     }
 
-    impl<K, V> FlatMapVisitor<K, V> {
+    impl<K, V, L> FlatMapVisitor<K, V, L> {
         fn new() -> Self {
             FlatMapVisitor {
                 marker: PhantomData
@@ -620,11 +697,12 @@ mod serde_impl
         }
     }
 
-    impl<'de, K: Ord, V> Visitor<'de> for FlatMapVisitor<K, V>
+    impl<'de, K: Ord, V, L> Visitor<'de> for FlatMapVisitor<K, V, L>
         where K: Deserialize<'de>,
-            V: Deserialize<'de>
+              V: Deserialize<'de>,
+              L: Lookup<K, V, K> + Default
     {
-        type Value = FlatMap<K, V>;
+        type Value = FlatMap<K, V, L>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
             formatter.write_str("a flat_map")
@@ -633,7 +711,8 @@ mod serde_impl
         fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
             where M: MapAccess<'de>
         {
-            let mut map = FlatMap::with_capacity(access.size_hint().unwrap_or(0));
+            let mut map = FlatMap::default();
+            map.reserve(access.size_hint().unwrap_or(0));
             while let Some((key, value)) = access.next_entry()? {
                 map.insert(key, value);
             }
@@ -641,9 +720,10 @@ mod serde_impl
         }
     }
 
-    impl<'de, K: Ord, V> Deserialize<'de> for FlatMap<K, V>
+    impl<'de, K: Ord, V, L> Deserialize<'de> for FlatMap<K, V, L>
         where K: Deserialize<'de>,
-            V: Deserialize<'de>
+              V: Deserialize<'de>,
+              L: Lookup<K, V, K> + Default
     {
         fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where D: Deserializer<'de>
